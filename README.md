@@ -14,12 +14,7 @@
 <h3 align="center">Your GameCube and Wii library, on the PS4.</h3>
 
 <p align="center">
-  <a href="https://github.com/iHaiDeeZ/DolphinPS4/releases/latest"><b>⬇ Get the latest version</b></a> ·
-  <a href="https://discord.gg/QwtU8ZaCth">Discord</a> ·
-  <a href="#getting-started">Getting started</a> ·
-  <a href="#controls">Controls</a> ·
-  <a href="#faq">FAQ</a> ·
-  <a href="CREDITS.md">Credits</a>
+
 </p>
 
 ---
