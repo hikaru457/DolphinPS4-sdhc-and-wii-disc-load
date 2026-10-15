@@ -1,1 +1,127 @@
+name: Build Dolphin PS4 PKG
 
+# Compila el PKG en los servidores de GitHub (sin WSL). Sigue BUILDING.md paso a paso.
+# Se lanza a mano: pestaña Actions -> "Build Dolphin PS4 PKG" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versión del PKG (NN.NN). Vacío = la del archivo VERSION del repositorio (04.10)"
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      PSB: /home/runner/dolphinps4-build
+      DOLPHIN_PS4_VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout del fork
+        uses: actions/checkout@v4
+
+      - name: Liberar disco
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3-venv python3-pil pkg-config \
+            flex bison glslang-tools libxml2 curl git zip xz-utils gettext
+
+      - name: clang 21 y lld 21
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y clang-21 lld-21 llvm-21
+          clang-21 --version
+          ld.lld-21 --version
+          llvm-ar-21 --version
+
+      - name: OpenOrbis (PacBrew) en /opt/pacbrew/ps4/openorbis
+        run: |
+          # 1) Intento normal con pacbrew-pacman (su servidor a veces no responde: 3 intentos).
+          gh release download --repo PacBrew/pacbrew-pacman --pattern '*.deb' --dir /tmp
+          sudo dpkg -i /tmp/pacbrew-pacman*.deb
+          for i in 1 2 3; do
+            if sudo pacbrew-pacman -Sy --noconfirm && sudo pacbrew-pacman -S --noconfirm ps4-openorbis; then
+              break
+            fi
+            echo "PacBrew no responde (intento $i/3), espero 30 s..."
+            sleep 30
+          done
+          # 2) Plan B: sacar /opt/pacbrew de la imagen Docker xfangfang/pacbrew (ya trae ps4-openorbis).
+          if [ ! -f /opt/pacbrew/ps4/openorbis/ps4vars.sh ]; then
+            echo "Usando la imagen Docker xfangfang/pacbrew"
+            docker pull xfangfang/pacbrew:latest
+            id=$(docker create xfangfang/pacbrew:latest /bin/true)
+            rm -rf /tmp/pacbrew-copy
+            docker cp "$id:/opt/pacbrew" /tmp/pacbrew-copy
+            docker rm "$id"
+            sudo rm -rf /opt/pacbrew
+            sudo mv /tmp/pacbrew-copy /opt/pacbrew
+          fi
+          test -f /opt/pacbrew/ps4/openorbis/ps4vars.sh
+          ls /opt/pacbrew/ps4/openorbis
+
+      - name: Permisos y saltos de línea de los scripts
+        run: |
+          sed -i 's/\r$//' scripts/*.sh toolchain/*.sh toolchain/bin/*
+          chmod +x scripts/*.sh toolchain/*.sh toolchain/bin/*
+
+      - name: Código de Dolphin (commit de BASE.txt) + parche
+        run: |
+          BASE=$(awk '{print $2}' patches/BASE.txt)
+          echo "Dolphin base: $BASE"
+          mkdir -p "$PSB/src/dolphin"
+          cd "$PSB/src/dolphin"
+          git init -q .
+          git remote add origin https://github.com/dolphin-emu/dolphin
+          git fetch --depth 1 origin "$BASE"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          git apply "$GITHUB_WORKSPACE/patches/dolphin-ps4.patch"
+
+      - name: Mesa 26.0.8 + libdrm (solo cabeceras) + herramientas de host
+        run: |
+          git clone --depth 1 --branch mesa-26.0.8 https://gitlab.freedesktop.org/mesa/mesa.git "$PSB/src/mesa"
+          git -C "$PSB/src/mesa" apply "$GITHUB_WORKSPACE/patches/mesa-ps4.patch"
+          git clone --depth 1 --branch libdrm-2.4.125 https://gitlab.freedesktop.org/mesa/libdrm.git "$PSB/src/libdrm"
+          python3 -m venv "$PSB/mesa-venv"
+          "$PSB/mesa-venv/bin/pip" install meson mako pyyaml packaging setuptools
+          mkdir -p "$PSB/host-tools/bin"
+          ln -sf "$(command -v glslangValidator)" "$PSB/host-tools/bin/glslangValidator"
+
+      - name: Sysroot (libc++ 21 y runtime)
+        run: |
+          toolchain/build-libcxx.sh
+          toolchain/build-runtime.sh
+
+      - name: Mesa (RADV para la GPU de la PS4)
+        run: scripts/build-mesa.sh setup
+
+      - name: Configurar y compilar Dolphin
+        run: |
+          scripts/configure-dolphin.sh
+          scripts/build-dolphin.sh
+
+      - name: Empaquetar el PKG
+        run: |
+          scripts/package-dolphin.sh
+          ls -la "$PSB/out"
+
+      - name: Subir el PKG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-PS4-pkg
+          path: /home/runner/dolphinps4-build/out/*
+          if-no-files-found: error
