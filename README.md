@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/iHaiDeeZ/DolphinPS4/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/iHaiDeeZ/DolphinPS4?label=release&color=5bb8ff"></a>
+
   <img alt="PS4 homebrew" src="https://img.shields.io/badge/PS4-homebrew-1f5fd6">
   <img alt="GameCube and Wii" src="https://img.shields.io/badge/GameCube%20%2B%20Wii-Dolphin-5cd3ff">
   <a href="https://discord.gg/QwtU8ZaCth"><img alt="Discord" src="https://img.shields.io/badge/Discord-join%20the%20testers-5865F2?logo=discord&logoColor=white"></a>
