@@ -237,26 +237,59 @@ def patch_xmb():
 
 
 # ======================================================================== MainNoGUI.cpp
+WII_DISC_BOOT = (
+    "    // Settings -> System -> Wii Disc: the disc for the Wii Menu, .wad files and Wii programs\n"
+    "    // (Dolphin's default ISO). A disc chosen some other way for this run (launch.txt's disc=)\n"
+    "    // is not replaced.\n"
+    "    {\n"
+    '      const std::string wii_disc = Platform::GetPS4Option("wii_disc", "none");\n'
+    '      if (wii_disc != "none" && File::Exists(wii_disc) &&\n'
+    "          Config::Get(Config::MAIN_DEFAULT_ISO).empty())\n"
+    "        Config::SetCurrent(Config::MAIN_DEFAULT_ISO, wii_disc);\n"
+    "    }\n"
+)
+
+
+def statement_end(text, pos):
+    """Index just after the ';' that ends the statement `pos` is inside (parentheses balanced)."""
+    depth, i, n = 0, pos, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            quote = c
+            i += 1
+            while i < n and text[i] != quote:
+                i += 2 if text[i] == "\\" else 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == ";" and depth <= 0:
+            return i + 1
+        i += 1
+    fail("MainNoGUI.cpp: statement without end")
+
+
 def patch_main():
     s = read("MainNoGUI.cpp")
-    if "wii_disc" not in s:
-        m = re.search(r'^([ \t]*)(?:const\s+)?std::string\s+\w+\s*=\s*Platform::GetPS4Option\(\s*"launch_disc"',
-                      s, re.M)
-        if not m:
+    if "GetPS4Option(\"wii_disc\"" not in s:
+        # The place where the port applies the SD card settings is the most stable anchor: the same
+        # run, before the game boots. (Dolphin's default ISO is only read when a program or the
+        # Wii Menu boots, and a launch_disc set elsewhere is respected: see WII_DISC_BOOT.)
+        for anchor in (r'GetPS4Option\(\s*"sd_size"', r"MAIN_ALLOW_SD_WRITES", r"MAIN_WII_SD_CARD_FILESIZE"):
+            m = re.search(anchor, s)
+            if m:
+                end = statement_end(s, m.start())
+                nl = s.find("\n", end)
+                nl = len(s) if nl < 0 else nl + 1
+                s = s[:nl] + WII_DISC_BOOT + s[nl:]
+                break
+        else:
             m = re.search(r'^([ \t]*).*GetPS4Option\(\s*"launch_disc"', s, re.M)
-        if not m:
-            fail('MainNoGUI.cpp: the "launch_disc" handling was not found')
-        indent = m.group(1)
-        block = (
-            f"{indent}// Settings -> System -> Wii Disc: the disc for the Wii Menu, .wad files and Wii\n"
-            f"{indent}// programs. A launch_disc (launch.txt \"disc=\"), handled below, still wins.\n"
-            f"{indent}{{\n"
-            f'{indent}  const std::string wii_disc = Platform::GetPS4Option("wii_disc", "none");\n'
-            f'{indent}  if (wii_disc != "none" && File::Exists(wii_disc))\n'
-            f"{indent}    Config::SetCurrent(Config::MAIN_DEFAULT_ISO, wii_disc);\n"
-            f"{indent}}}\n"
-        )
-        s = s[: m.start()] + block + s[m.start():]
+            if not m:
+                fail("MainNoGUI.cpp: neither the SD card settings nor the launch_disc handling "
+                     "were found")
+            s = s[: m.start()] + WII_DISC_BOOT + s[m.start():]
     write("MainNoGUI.cpp", s)
     print("apply-fork-settings: MainNoGUI.cpp ok (Wii Disc at boot)")
 
