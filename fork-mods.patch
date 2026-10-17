@@ -1,0 +1,870 @@
+diff --git a/Source/Core/Common/FatFsUtil.cpp b/Source/Core/Common/FatFsUtil.cpp
+index ea0bb85..3da5ada 100644
+--- a/Source/Core/Common/FatFsUtil.cpp
++++ b/Source/Core/Common/FatFsUtil.cpp
+@@ -835,6 +835,51 @@ bool SyncSDImageToSDFolder(const std::function<bool()>& cancelled)
+   return true;
+ }
+ 
++bool ReadFileFromSDImage(const std::string& path, std::string* out)
++{
++  constexpr FSIZE_t MAX_FILE_SIZE = 8 * 1024 * 1024;
++
++  const std::string image_path = File::GetUserPath(F_WIISDCARDIMAGE_IDX);
++  if (image_path.empty() || !File::Exists(image_path))
++    return false;
++
++  std::lock_guard lk(s_fatfs_mutex);
++  SDCardFatFsCallbacks callbacks;
++  s_callbacks = &callbacks;
++  Common::ScopeGuard callbacks_guard{[] { s_callbacks = nullptr; }};
++
++  File::IOFile image;
++  callbacks.m_image = &image;
++  callbacks.m_deterministic = true;  // nothing is written
++  if (!image.Open(image_path, "rb"))
++    return false;
++
++  FATFS fs{};
++  if (f_mount(&fs, "", 0) != FR_OK)
++    return false;
++  Common::ScopeGuard unmount_guard{[] { f_unmount(""); }};  // before the image is closed
++
++  FIL file;
++  if (f_open(&file, path.c_str(), FA_READ) != FR_OK)
++    return false;
++  const FSIZE_t size = f_size(&file);
++  if (size > MAX_FILE_SIZE)
++  {
++    f_close(&file);
++    return false;
++  }
++  std::string data(static_cast<size_t>(size), '\0');
++  UINT bytes_read = 0;
++  const FRESULT result =
++      size == 0 ? FR_OK : f_read(&file, data.data(), static_cast<UINT>(size), &bytes_read);
++  f_close(&file);
++  if (result != FR_OK || bytes_read != size)
++    return false;
++
++  *out = std::move(data);
++  return true;
++}
++
+ void RunInFatFsContext(FatFsCallbacks& callbacks, const std::function<void()>& function)
+ {
+   std::lock_guard lk(s_fatfs_mutex);
+diff --git a/Source/Core/Common/FatFsUtil.h b/Source/Core/Common/FatFsUtil.h
+index 8c623d7..8f46f33 100644
+--- a/Source/Core/Common/FatFsUtil.h
++++ b/Source/Core/Common/FatFsUtil.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <functional>
++#include <string>
+ 
+ #include "Common/Common.h"
+ #include "Common/CommonTypes.h"
+@@ -16,6 +17,11 @@ static constexpr auto SD_UNPACK_TEXT = _trans("Unpack SD Card Now");
+ bool SyncSDFolderToSDImage(const std::function<bool()>& cancelled, bool deterministic);
+ bool SyncSDImageToSDFolder(const std::function<bool()>& cancelled);
+ 
++// Reads one file (at most 8 MiB) from the SD card image, without unpacking it: `path` is the path
++// on the card ("/codes/RSBE01.gct"; FAT file names are matched without regard to case). The image
++// is only opened for reading. False if there is no image or no such file.
++bool ReadFileFromSDImage(const std::string& path, std::string* out);
++
+ class FatFsCallbacks
+ {
+ public:
+diff --git a/Source/Core/Core/Boot/Boot_BS2Emu.cpp b/Source/Core/Core/Boot/Boot_BS2Emu.cpp
+index a44796d..75ba09a 100644
+--- a/Source/Core/Core/Boot/Boot_BS2Emu.cpp
++++ b/Source/Core/Core/Boot/Boot_BS2Emu.cpp
+@@ -20,6 +20,7 @@
+ #include "Core/ConfigManager.h"
+ #include "Core/Core.h"
+ #include "Core/Debugger/BranchWatch.h"
++#include "Core/GeckoCodeConfig.h"
+ #include "Core/HLE/HLE.h"
+ #include "Core/HW/DVD/AMMediaboard.h"
+ #include "Core/HW/DVD/DVDInterface.h"
+@@ -225,6 +226,10 @@ bool CBoot::RunApploader(Core::System& system, const Core::CPUThreadGuard& guard
+   RunFunction(system, iAppLoaderClose);
+   HLE::UnPatch(system, "AppLoaderReport");
+ 
++  // PS4 port: gameconfig.txt's poke lines (Project M and other Gecko OS mods), applied once with the
++  // game's executable in memory and before it runs, as Gecko OS does.
++  Gecko::ApplyGameConfigPokes(guard, volume.GetGameID());
++
+   // return
+   ppc_state.pc = ppc_state.gpr[3];
+ 
+diff --git a/Source/Core/Core/GeckoCode.cpp b/Source/Core/Core/GeckoCode.cpp
+index 79b8449..2cfdf07 100644
+--- a/Source/Core/Core/GeckoCode.cpp
++++ b/Source/Core/Core/GeckoCode.cpp
+@@ -48,6 +48,22 @@ static Installation s_code_handler_installed = Installation::Uninstalled;
+ static std::vector<GeckoCode> s_active_codes;
+ static std::vector<GeckoCode> s_synced_codes;
+ static std::mutex s_active_codes_lock;
++// Relocated code list (Gecko OS gameconfig.txt codeliststart / codelistend); 0 = Dolphin's default
++static u32 s_code_list_start = 0;
++static u32 s_code_list_end = 0;
++
++void SetCodeListRegion(u32 start, u32 end)
++{
++  std::lock_guard lk(s_active_codes_lock);
++  if (start == 0 || end <= start)
++  {
++    s_code_list_start = 0;
++    s_code_list_end = 0;
++    return;
++  }
++  s_code_list_start = start;
++  s_code_list_end = end;
++}
+ 
+ size_t CountEnabledCodes()
+ {
+@@ -152,9 +168,44 @@ static Installation InstallCodeHandlerLocked(const Core::CPUThreadGuard& guard)
+     }
+   }
+ 
+-  const u32 codelist_base_address =
++  const u32 default_codelist_base_address =
+       INSTALLER_BASE_ADDRESS + static_cast<u32>(data.size()) - CODE_SIZE;
+-  const u32 codelist_end_address = INSTALLER_END_ADDRESS;
++  u32 codelist_base_address = default_codelist_base_address;
++  u32 codelist_end_address = INSTALLER_END_ADDRESS;
++
++  if (s_code_list_start != 0)
++  {
++    // The handler loads the list's address with "lis r15, hi; ori r15, r15, lo" (0x104 / 0x108 in
++    // codehandler.bin, as in codehandleronly.s). Check that the pair is where it should be, then
++    // point it at the relocated list (what Gecko OS does for gameconfig.txt's codeliststart).
++    constexpr u32 LIS_OFFSET = 0x104;
++    constexpr u32 ORI_OFFSET = 0x108;
++    const u32 expected_lis = 0x3de00000u | (default_codelist_base_address >> 16);
++    const u32 expected_ori = 0x61ef0000u | (default_codelist_base_address & 0xffff);
++    const bool valid_region = (s_code_list_start & 3) == 0 && s_code_list_start >= 0x80003000 &&
++                              s_code_list_end <= 0x81800000 &&
++                              s_code_list_end - s_code_list_start >= 4 * CODE_SIZE;
++    if (valid_region && data.size() >= ORI_OFFSET + 4 &&
++        PowerPC::MMU::HostRead<u32>(guard, INSTALLER_BASE_ADDRESS + LIS_OFFSET) == expected_lis &&
++        PowerPC::MMU::HostRead<u32>(guard, INSTALLER_BASE_ADDRESS + ORI_OFFSET) == expected_ori)
++    {
++      PowerPC::MMU::HostWrite<u32>(guard, 0x3de00000u | (s_code_list_start >> 16),
++                                   INSTALLER_BASE_ADDRESS + LIS_OFFSET);
++      PowerPC::MMU::HostWrite<u32>(guard, 0x61ef0000u | (s_code_list_start & 0xffff),
++                                   INSTALLER_BASE_ADDRESS + ORI_OFFSET);
++      codelist_base_address = s_code_list_start;
++      codelist_end_address = s_code_list_end;
++      NOTICE_LOG_FMT(ACTIONREPLAY, "GeckoCodes: code list moved to {:08x}-{:08x}",
++                     codelist_base_address, codelist_end_address);
++    }
++    else
++    {
++      ERROR_LOG_FMT(ACTIONREPLAY,
++                    "GeckoCodes: can't move the code list to {:08x}-{:08x} (invalid region or "
++                    "unexpected codehandler.bin); using the default list",
++                    s_code_list_start, s_code_list_end);
++    }
++  }
+ 
+   // Write a magic value to 'gameid' (codehandleronly does not actually read this).
+   // This value will be read back and modified over time by HLE_Misc::GeckoCodeHandlerICacheFlush.
+@@ -230,6 +281,8 @@ void Shutdown()
+ {
+   std::lock_guard codes_lock(s_active_codes_lock);
+   s_active_codes.clear();
++  s_code_list_start = 0;
++  s_code_list_end = 0;
+   s_code_handler_installed = Installation::Uninstalled;
+ }
+ 
+@@ -252,6 +305,10 @@ void RunCodeHandler(const Core::CPUThreadGuard& guard)
+       // A warning was already issued for the install failing
+       if (s_code_handler_installed != Installation::Installed)
+         return;
++
++      // A relocated code list is a Gecko OS mod (Project M...): say it is running.
++      if (s_code_list_start != 0)
++        Core::DisplayMessage("Gecko OS mod: its code list is installed", 6000);
+     }
+   }
+ 
+diff --git a/Source/Core/Core/GeckoCode.h b/Source/Core/Core/GeckoCode.h
+index 716bcf9..f9bcffc 100644
+--- a/Source/Core/Core/GeckoCode.h
++++ b/Source/Core/Core/GeckoCode.h
+@@ -65,6 +65,12 @@ void SetActiveCodes(std::span<const GeckoCode> gcodes, const std::string& game_i
+ void SetSyncedCodesAsActive();
+ void UpdateSyncedCodes(std::span<const GeckoCode> gcodes);
+ std::vector<GeckoCode> SetAndReturnActiveCodes(std::span<const GeckoCode> gcodes);
++// Where the code handler reads its code list. By default the list sits right behind the handler
++// (0x80001800 + the handler's size, up to INSTALLER_END_ADDRESS: about 3 KB), which is far too small
++// for Gecko OS mods such as Project M (a 64 KB list at 0x80570000, from gameconfig.txt's
++// codeliststart / codelistend). With a region set, the handler is patched to read its list there.
++// start == 0 restores the default. The region is applied the next time the handler is installed.
++void SetCodeListRegion(u32 start, u32 end);
+ void RunCodeHandler(const Core::CPUThreadGuard& guard);
+ void Shutdown();
+ void DoState(PointerWrap&);
+diff --git a/Source/Core/Core/GeckoCodeConfig.cpp b/Source/Core/Core/GeckoCodeConfig.cpp
+index 83243c8..9bbca09 100644
+--- a/Source/Core/Core/GeckoCodeConfig.cpp
++++ b/Source/Core/Core/GeckoCodeConfig.cpp
+@@ -3,15 +3,29 @@
+ 
+ #include "Core/GeckoCodeConfig.h"
+ 
++#include <fmt/format.h>
++
++#include <algorithm>
++#include <cctype>
++#include <cstdlib>
++#include <filesystem>
+ #include <optional>
+ #include <sstream>
+ #include <string>
++#include <system_error>
+ #include <vector>
+ 
++#include "Common/FatFsUtil.h"
++#include "Common/FileUtil.h"
+ #include "Common/HttpRequest.h"
++#include "Common/Logging/Log.h"
+ #include "Common/IniFile.h"
+ #include "Common/StringUtil.h"
+ #include "Core/CheatCodes.h"
++#include "Core/ConfigManager.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/Core.h"
++#include "Core/PowerPC/MMU.h"
+ 
+ namespace Gecko
+ {
+@@ -121,6 +135,388 @@ std::expected<std::vector<GeckoCode>, int> DownloadCodes(std::string_view gametd
+   return gcodes;
+ }
+ 
++// ---- Gecko OS gameconfig.txt ------------------------------------------------------------------
++namespace
++{
++std::string_view Trim(std::string_view text)
++{
++  while (!text.empty() && (text.front() == ' ' || text.front() == '\t' || text.front() == '\r'))
++    text.remove_prefix(1);
++  while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' ||
++                           text.back() == '\n'))
++  {
++    text.remove_suffix(1);
++  }
++  return text;
++}
++
++// The hexadecimal numbers of "(a, b, c)" / "= a" / "a b c" in order; false on a stray character.
++bool ParseHexList(std::string_view text, std::vector<u32>* out)
++{
++  out->clear();
++  size_t i = 0;
++  while (i < text.size())
++  {
++    const char c = text[i];
++    if (c == ' ' || c == '\t' || c == ',' || c == '(' || c == '=')
++    {
++      i++;
++      continue;
++    }
++    if (c == ')')
++      break;
++    size_t end = i;
++    while (end < text.size() && std::isxdigit(static_cast<unsigned char>(text[end])) != 0)
++      end++;
++    if ((end < text.size() && text[end] == 'x' && end == i + 1 && text[i] == '0'))
++    {
++      // 0x prefix
++      i = end + 1;
++      end = i;
++      while (end < text.size() && std::isxdigit(static_cast<unsigned char>(text[end])) != 0)
++        end++;
++    }
++    if (end == i)
++      return false;
++    out->push_back(static_cast<u32>(std::strtoull(std::string(text.substr(i, end - i)).c_str(),
++                                                  nullptr, 16)));
++    i = end;
++  }
++  return true;
++}
++
++std::string LowerCase(std::string_view text)
++{
++  std::string result(text);
++  std::ranges::transform(result, result.begin(),
++                         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++  return result;
++}
++}  // namespace
++
++GameConfig ParseGameConfig(std::string_view text, std::string_view game_id)
++{
++  struct Section
++  {
++    int specificity = 0;
++    std::vector<std::string_view> lines;
++  };
++  std::vector<Section> sections;
++  Section* current = nullptr;
++
++  size_t pos = 0;
++  while (pos <= text.size())
++  {
++    size_t eol = text.find_first_of("\r\n", pos);
++    if (eol == std::string_view::npos)
++      eol = text.size();
++    const std::string_view line = Trim(text.substr(pos, eol - pos));
++    pos = eol + 1;
++    if (line.empty() || line.front() == '#' || line.starts_with("//"))
++      continue;
++
++    // "RSB?01:" starts a section (the id may be followed by a comment)
++    const size_t colon = line.find(':');
++    if (colon != std::string_view::npos && line.find_first_of("=(") == std::string_view::npos)
++    {
++      const std::string_view id = Trim(line.substr(0, colon));
++      current = nullptr;
++      if (id.empty() || id.find(' ') != std::string_view::npos)
++        continue;
++      if (LowerCase(id) == "default")
++      {
++        sections.push_back({0, {}});
++        current = &sections.back();
++        continue;
++      }
++      if (id.size() > game_id.size())
++        continue;
++      bool match = true;
++      int specificity = 0;
++      for (size_t i = 0; i < id.size(); i++)
++      {
++        if (id[i] == '?')
++          continue;
++        if (id[i] != game_id[i])
++        {
++          match = false;
++          break;
++        }
++        specificity++;
++      }
++      if (!match)
++        continue;
++      sections.push_back({specificity, {}});
++      current = &sections.back();
++      continue;
++    }
++    if (current != nullptr)
++      current->lines.push_back(line);
++  }
++
++  std::ranges::stable_sort(sections,
++                           [](const Section& a, const Section& b) { return a.specificity < b.specificity; });
++
++  GameConfig config;
++  std::vector<u32> numbers;
++  for (const Section& section : sections)
++  {
++    for (const std::string_view line : section.lines)
++    {
++      const size_t key_end = line.find_first_of(" \t(=");
++      const std::string key = LowerCase(line.substr(0, key_end));
++      const std::string_view args = key_end == std::string_view::npos ? "" : line.substr(key_end);
++      if (key == "codeliststart" || key == "codelistend" || key == "hooktype")
++      {
++        if (!ParseHexList(args, &numbers) || numbers.size() != 1)
++          continue;
++        if (key == "codeliststart")
++          config.code_list_start = numbers[0];
++        else if (key == "codelistend")
++          config.code_list_end = numbers[0];
++        else
++          config.hook_type = numbers[0];  // decimal in Gecko OS, but only informational here
++      }
++      else if (key == "poke")
++      {
++        if (!ParseHexList(args, &numbers) || numbers.size() != 2)
++          continue;
++        config.pokes.push_back({numbers[0], numbers[1], false, 0, 0});
++      }
++      else if (key == "pokeifequal")
++      {
++        if (!ParseHexList(args, &numbers) || numbers.size() != 4)
++          continue;
++        config.pokes.push_back({numbers[2], numbers[3], true, numbers[0], numbers[1]});
++      }
++    }
++  }
++  return config;
++}
++
++#ifdef __ORBIS__
++namespace
++{
++constexpr char SD_CODES_CREATOR[] = "SD card (codes)";
++constexpr size_t MAX_SD_FILE_SIZE = 8 * 1024 * 1024;
++
++enum class SDSource
++{
++  None,
++  Folder,  // User/Load/WiiSDSync
++  Image    // User/Load/WiiSD.raw
++};
++
++// The entry of `dir` called `name`, without regard to case: the console's file system tells
++// "RSBE01.gct" from "rsbe01.gct", the FAT card the mod was made on doesn't.
++std::optional<std::string> FindNoCase(const std::string& dir, const std::string& name)
++{
++  std::error_code error;
++  if (std::filesystem::exists(dir + "/" + name, error))
++    return name;
++  const std::string wanted = LowerCase(name);
++  std::filesystem::directory_iterator it(dir, error);
++  const std::filesystem::directory_iterator end;
++  for (; !error && it != end; it.increment(error))
++  {
++    const std::string found = it->path().filename().string();
++    if (LowerCase(found) == wanted)
++      return found;
++  }
++  return std::nullopt;
++}
++
++// A file of the emulated SD card, by its path on the card ("codes/RSBE01.gct"; names are matched
++// without regard to case). First the SD folder (User/Load/WiiSDSync), then the card image
++// (User/Load/WiiSD.raw): the mod works from either, with no unpacking.
++SDSource ReadSDFile(const std::string& path, std::string* out)
++{
++  std::string current = File::GetUserPath(D_WIISDCARDSYNCFOLDER_IDX);
++  while (!current.empty() && current.back() == '/')
++    current.pop_back();
++  if (!current.empty())
++  {
++    bool found = true;
++    for (const std::string& part : SplitString(path, '/'))
++    {
++      if (part.empty())
++        continue;
++      const std::optional<std::string> name = FindNoCase(current, part);
++      if (!name)
++      {
++        found = false;
++        break;
++      }
++      current += "/" + *name;
++    }
++    std::string text;
++    if (found && File::ReadFileToString(current, text) && text.size() <= MAX_SD_FILE_SIZE)
++    {
++      *out = std::move(text);
++      return SDSource::Folder;
++    }
++  }
++  std::string text;
++  if (Common::ReadFileFromSDImage("/" + path, &text) && text.size() <= MAX_SD_FILE_SIZE)
++  {
++    *out = std::move(text);
++    return SDSource::Image;
++  }
++  return SDSource::None;
++}
++
++const char* SDSourceName(SDSource source)
++{
++  return source == SDSource::Folder ? "SD folder" : "SD image";
++}
++
++// The names a game's Gecko OS code list can have: RSBE01.gct, RSB.gct, RSBE.gct.
++std::vector<std::string> GCTNames(const std::string& game_id)
++{
++  return {game_id + ".gct", game_id.substr(0, 3) + ".gct", game_id.substr(0, 4) + ".gct"};
++}
++
++u32 BigEndianWord(const std::string& raw, size_t offset)
++{
++  return (static_cast<u32>(static_cast<u8>(raw[offset])) << 24) |
++         (static_cast<u32>(static_cast<u8>(raw[offset + 1])) << 16) |
++         (static_cast<u32>(static_cast<u8>(raw[offset + 2])) << 8) |
++         static_cast<u32>(static_cast<u8>(raw[offset + 3]));
++}
++}  // namespace
++
++// Reads a Gecko OS code list (.gct): 00D0C0DE 00D0C0DE, code lines, F0000000 00000000. Whatever
++// follows the end marker is ignored. Nothing is added when the game has no code list.
++static void LoadGCTFromSD(std::vector<GeckoCode>& gcodes)
++{
++  // A code list region from an earlier game must not outlive it.
++  SetCodeListRegion(0, 0);
++  const std::string game_id = SConfig::GetInstance().GetGameID();
++  if (game_id.size() < 4)
++    return;
++  for (const std::string& name : GCTNames(game_id))
++  {
++    std::string raw;
++    const SDSource source = ReadSDFile("codes/" + name, &raw);
++    if (source == SDSource::None)
++      continue;
++    if (raw.size() < 16 || BigEndianWord(raw, 0) != 0x00D0C0DE || BigEndianWord(raw, 4) != 0x00D0C0DE)
++    {
++      WARN_LOG_FMT(ACTIONREPLAY, "GCT {} ({}) is not a Gecko code list", name, SDSourceName(source));
++      continue;
++    }
++    GeckoCode gcode;
++    gcode.name = "GCT: " + name;
++    gcode.creator = SD_CODES_CREATOR;
++    gcode.enabled = true;
++    gcode.default_enabled = true;
++    for (size_t offset = 8; offset + 8 <= raw.size(); offset += 8)
++    {
++      const u32 address = BigEndianWord(raw, offset);
++      const u32 data = BigEndianWord(raw, offset + 4);
++      if (address == 0xF0000000)  // end of the list
++        break;
++      GeckoCode::Code code;
++      code.address = address;
++      code.data = data;
++      code.original_line = fmt::format("{:08X} {:08X}", address, data);
++      gcode.codes.push_back(std::move(code));
++    }
++    if (gcode.codes.empty())
++      continue;
++
++    u32 capacity = INSTALLER_END_ADDRESS - INSTALLER_BASE_ADDRESS;
++
++    // Gecko OS keeps long lists (Project M: 64 KB) elsewhere in memory, as gameconfig.txt says:
++    // codeliststart = 80570000 / codelistend = 80580000.
++    std::string gameconfig;
++    const SDSource config_source = ReadSDFile("gameconfig.txt", &gameconfig);
++    if (config_source != SDSource::None)
++    {
++      const GameConfig config = ParseGameConfig(gameconfig, game_id);
++      if (config.code_list_start)
++      {
++        const u32 start = *config.code_list_start;
++        const u32 end = config.code_list_end.value_or(start + static_cast<u32>(raw.size()) + 16);
++        SetCodeListRegion(start, end);
++        capacity = end - start;
++        NOTICE_LOG_FMT(ACTIONREPLAY, "gameconfig.txt ({}): code list at {:08x}-{:08x}, hook type {}",
++                       SDSourceName(config_source), start, end, config.hook_type.value_or(1));
++      }
++    }
++    NOTICE_LOG_FMT(ACTIONREPLAY,
++                   "GCT {} ({}): {} code lines ({} bytes of Gecko code space; {} bytes fit)", name,
++                   SDSourceName(source), gcode.codes.size(), gcode.codes.size() * 8, capacity);
++    if (gcode.codes.size() * 8 + 8 > capacity)
++    {
++      WARN_LOG_FMT(ACTIONREPLAY,
++                   "GCT {} is bigger than the code space: add codeliststart / codelistend to "
++                   "gameconfig.txt (Gecko OS mods ship one)",
++                   name);
++    }
++    gcodes.push_back(std::move(gcode));
++    return;
++  }
++}
++
++void ApplyGameConfigPokes(const Core::CPUThreadGuard& guard, const std::string& game_id)
++{
++  if (!Config::AreCheatsEnabled() || game_id.size() < 4)
++    return;
++  // Only for a game with a Gecko OS code list on the card, so a stray gameconfig.txt doesn't touch
++  // an unmodded game.
++  std::string probe;
++  bool has_codes = false;
++  for (const std::string& name : GCTNames(game_id))
++  {
++    if (ReadSDFile("codes/" + name, &probe) != SDSource::None)
++    {
++      has_codes = true;
++      break;
++    }
++  }
++  if (!has_codes)
++    return;
++  std::string gameconfig;
++  const SDSource source = ReadSDFile("gameconfig.txt", &gameconfig);
++  if (source == SDSource::None)
++  {
++    Core::DisplayMessage("Gecko OS codes found, but there is no gameconfig.txt on the SD card", 8000);
++    return;
++  }
++
++  const GameConfig config = ParseGameConfig(gameconfig, game_id);
++  int applied = 0;
++  for (const StartupPoke& poke : config.pokes)
++  {
++    const auto valid = [](u32 address) { return address >= 0x80000000 && address < 0x81800000; };
++    if (!valid(poke.address) || (poke.conditional && !valid(poke.cond_address)))
++    {
++      WARN_LOG_FMT(ACTIONREPLAY, "gameconfig.txt: poke at {:08x} is outside MEM1, skipped",
++                   poke.address);
++      continue;
++    }
++    if (poke.conditional &&
++        PowerPC::MMU::HostRead<u32>(guard, poke.cond_address) != poke.cond_value)
++    {
++      continue;
++    }
++    PowerPC::MMU::HostWrite<u32>(guard, poke.value, poke.address);
++    applied++;
++  }
++  NOTICE_LOG_FMT(ACTIONREPLAY, "gameconfig.txt ({}): {} of {} pokes applied", SDSourceName(source),
++                 applied, config.pokes.size());
++  Core::DisplayMessage(
++      fmt::format("Gecko OS mod: gameconfig.txt read from the {} ({} startup pokes)",
++                  SDSourceName(source), applied),
++      8000);
++}
++#else
++void ApplyGameConfigPokes(const Core::CPUThreadGuard&, const std::string&)
++{
++}
++#endif
++
+ std::vector<GeckoCode> LoadCodes(const Common::IniFile& globalIni, const Common::IniFile& localIni)
+ {
+   std::vector<GeckoCode> gcodes;
+@@ -197,6 +593,28 @@ std::vector<GeckoCode> LoadCodes(const Common::IniFile& globalIni, const Common:
+     }
+   }
+ 
++
++#ifdef __ORBIS__
++  // Mods built on Gecko OS (Project M / Project+ / BrawlEX mods...) ship their codes as a .gct in
++  // the SD card's codes folder, and a homebrew loader (Gecko OS) that applies them: that loader
++  // can't run in Dolphin, so the .gct is read here and runs as a Gecko code. It is looked for in
++  // the SD folder (User/Load/WiiSDSync/codes) and in the card image (User/Load/WiiSD.raw), as
++  // <GAMEID>.gct, then <GAME ID without region>.gct (e.g. RSBE01 -> RSB), in any letter case.
++  {
++    std::vector<GeckoCode> sd_codes;
++    LoadGCTFromSD(sd_codes);
++    const bool duplicate =
++        !sd_codes.empty() && std::ranges::any_of(gcodes, [&](const GeckoCode& code) {
++          return code.name == sd_codes.front().name;
++        });
++    if (!sd_codes.empty() && !duplicate)
++    {
++      // The cheats menu can switch it off (the name is saved in [Gecko_Disabled]).
++      ReadEnabledAndDisabled(localIni, "Gecko", &sd_codes);
++      gcodes.push_back(std::move(sd_codes.front()));
++    }
++  }
++#endif
+   return gcodes;
+ }
+ 
+diff --git a/Source/Core/Core/GeckoCodeConfig.h b/Source/Core/Core/GeckoCodeConfig.h
+index c312700..17eb738 100644
+--- a/Source/Core/Core/GeckoCodeConfig.h
++++ b/Source/Core/Core/GeckoCodeConfig.h
+@@ -7,6 +7,7 @@
+ #include <optional>
+ #include <span>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include "Core/GeckoCode.h"
+@@ -16,6 +17,11 @@ namespace Common
+ class IniFile;
+ }
+ 
++namespace Core
++{
++class CPUThreadGuard;
++}
++
+ namespace Gecko
+ {
+ std::vector<GeckoCode> LoadCodes(const Common::IniFile& globalIni, const Common::IniFile& localIni);
+@@ -23,4 +29,34 @@ std::expected<std::vector<GeckoCode>, int> DownloadCodes(std::string_view gametd
+ void SaveCodes(Common::IniFile& inifile, std::span<const GeckoCode> gcodes);
+ 
+ std::optional<GeckoCode::Code> DeserializeLine(const std::string& line);
++
++// What Project M, Project+ and other BrawlEX-based mods need from Gecko OS's gameconfig.txt.
++// Gecko OS (boot.elf) can't run inside Dolphin, so its configuration is read here instead.
++struct StartupPoke
++{
++  u32 address = 0;
++  u32 value = 0;
++  bool conditional = false;  // pokeifequal: only if the word at cond_address == cond_value
++  u32 cond_address = 0;
++  u32 cond_value = 0;
++};
++
++struct GameConfig
++{
++  std::optional<u32> code_list_start;  // codeliststart
++  std::optional<u32> code_list_end;    // codelistend
++  std::optional<u32> hook_type;        // hooktype (informational: Dolphin runs the handler each VI)
++  std::vector<StartupPoke> pokes;      // poke / pokeifequal, in file order
++};
++
++// Parses a Gecko OS gameconfig.txt for `game_id` (6 characters, e.g. "RSBE01"). Sections are
++// "RSB?01:" (? matches any character, a shorter id matches as a prefix) or "DEFAULT:"; the more
++// specific a section is, the later it is applied. searchandpoke / hook / ... are not supported.
++GameConfig ParseGameConfig(std::string_view text, std::string_view game_id);
++
++// Applies the poke / pokeifequal lines of the game's gameconfig.txt (SD root of the emulated SD
++// card) once, right after the game's executable is in memory and before it runs, as Gecko OS does.
++// Only when a Gecko OS code list (codes/<game id>.gct) is on the SD card, so a stray gameconfig.txt
++// doesn't touch an unmodded game. Does nothing outside the PS4 build.
++void ApplyGameConfigPokes(const Core::CPUThreadGuard& guard, const std::string& game_id);
+ }  // namespace Gecko
+diff --git a/Source/Core/DolphinNoGUI/MainNoGUI.cpp b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
+index 9456df4..4d5423a 100644
+--- a/Source/Core/DolphinNoGUI/MainNoGUI.cpp
++++ b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
+@@ -913,7 +913,15 @@ int main(int argc, char* argv[])
+   // A homebrew program with a disc in the drive (launch.txt's disc= line, Play Online with
+   // Wiimmfi): Dolphin inserts the default ISO when it boots a program - for this run only.
+   {
+-    const std::string disc = Platform::GetPS4Option("launch_disc", "");
++    std::string disc = Platform::GetPS4Option("launch_disc", "");
++    if (disc.empty())
++    {
++      // Settings -> System -> Wii Disc: the disc for the Wii Menu, .wad files and Wii programs.
++      const std::string chosen = Platform::GetPS4Option("wii_disc", "none");
++      struct stat disc_stat;
++      if (chosen != "none" && stat(chosen.c_str(), &disc_stat) == 0)
++        disc = chosen;
++    }
+     if (!disc.empty())
+     {
+       Config::SetCurrent(Config::MAIN_DEFAULT_ISO, disc);
+diff --git a/Source/Core/DolphinNoGUI/PS4Settings.cpp b/Source/Core/DolphinNoGUI/PS4Settings.cpp
+index 5a1bd41..3044242 100755
+--- a/Source/Core/DolphinNoGUI/PS4Settings.cpp
++++ b/Source/Core/DolphinNoGUI/PS4Settings.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cstdlib>
++#include <deque>
+ #include <fstream>
+ #include <map>
+ #include <mutex>
+@@ -21,6 +22,7 @@
+ #include "Common/Logging/LogManager.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
++#include "DolphinNoGUI/PS4XMB.h"
+ #include "VideoCommon/VideoConfig.h"
+ 
+ extern "C" int ps4_show_fps;        // VideoCommon/Present.cpp
+@@ -39,7 +41,7 @@ namespace PS4Settings
+ {
+ namespace
+ {
+-const std::vector<Setting> SETTINGS = {
++std::vector<Setting> SETTINGS = {
+     // Video
+     {"aspect", "Aspect Ratio", "Video",
+      {{"auto", "Auto"}, {"wide", "16:9"}, {"standard", "4:3"}, {"stretch", "Stretch"}},
+@@ -225,8 +227,12 @@ const std::vector<Setting> SETTINGS = {
+      "Lets games save to the SD card. Off: it is read-only."},
+     {"sd_size", "SD Card Size", "System",
+      {{"0", "Auto"}, {"128", "128 MB"}, {"256", "256 MB"}, {"512", "512 MB"}, {"1024", "1 GB"},
+-      {"2048", "2 GB"}},
++      {"2048", "2 GB"}, {"4096", "4 GB (SDHC)"}, {"8192", "8 GB (SDHC)"},
++      {"16384", "16 GB (SDHC)"}, {"32768", "32 GB (SDHC)"}},
+      "0", false, "Auto makes the card just big enough for the folder's files."},
++    {"wii_disc", "Wii Disc", "System", {{"none", "None"}}, "none", false,
++     "The disc in the Wii's drive for the Wii Menu, .wad files and Wii homebrew (.dol / .elf, such "
++     "as the Project M loader). The list is read when the app starts."},
+     {"audio_buffer", "Audio Buffer", "System",
+      {{"100", "100 ms"}, {"150", "150 ms"}, {"200", "200 ms"}, {"250", "250 ms"},
+       {"300", "300 ms"}},
+@@ -407,6 +413,59 @@ const Setting* Find(const std::string& key)
+ // The data folder (settings.ini's), for playtime.ini.
+ static std::string s_data_dir;
+ 
++namespace
++{
++// The discs a Wii program can find "inserted" in the drive (Settings -> System -> Wii Disc): the
++// disc images of the games folder. Choice holds plain pointers, so the strings live here (filled
++// once, in Load).
++std::deque<std::string> s_disc_strings;
++
++void FillDiscChoices(const std::string& data_dir)
++{
++  static const char* const EXTENSIONS[] = {".iso", ".gcm", ".ciso", ".gcz",
++                                           ".wbfs", ".wia", ".rvz"};
++  const std::string games_dir = PS4XMB::GamesDir(data_dir);
++  std::vector<std::string> names;
++  std::error_code error;
++  std::filesystem::directory_iterator it(games_dir, error);
++  const std::filesystem::directory_iterator end;
++  for (; !error && it != end; it.increment(error))
++  {
++    std::error_code file_error;
++    if (!it->is_regular_file(file_error))
++      continue;
++    const std::string name = it->path().filename().string();
++    std::string lower = name;
++    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
++    for (const char* extension : EXTENSIONS)
++    {
++      const std::string ext = extension;
++      if (lower.size() > ext.size() &&
++          lower.compare(lower.size() - ext.size(), ext.size(), ext) == 0)
++      {
++        names.push_back(name);
++        break;
++      }
++    }
++  }
++  std::sort(names.begin(), names.end());
++  for (Setting& setting : SETTINGS)
++  {
++    if (std::string(setting.key) != "wii_disc")
++      continue;
++    setting.choices = {{"none", "None"}};
++    s_disc_strings.clear();
++    for (const std::string& name : names)
++    {
++      s_disc_strings.push_back(games_dir + "/" + name);  // the stored value
++      const char* value = s_disc_strings.back().c_str();
++      s_disc_strings.push_back(name);  // the label
++      setting.choices.push_back({value, s_disc_strings.back().c_str()});
++    }
++  }
++}
++}  // namespace
++
+ void Load(const std::string& data_dir)
+ {
+   std::lock_guard lock(s_mutex);
+@@ -429,6 +488,7 @@ void Load(const std::string& data_dir)
+     if (eq != std::string::npos)
+       s_sections[section][line.substr(0, eq)] = line.substr(eq + 1);
+   }
++  FillDiscChoices(data_dir);
+ }
+ 
+ void Save()
+diff --git a/Source/Core/DolphinNoGUI/PS4XMB.cpp b/Source/Core/DolphinNoGUI/PS4XMB.cpp
+index cb7df8b..2933d39 100755
+--- a/Source/Core/DolphinNoGUI/PS4XMB.cpp
++++ b/Source/Core/DolphinNoGUI/PS4XMB.cpp
+@@ -1889,7 +1889,7 @@ void Menu::BuildSettingRows()
+       "wii_pointer",
+       "wii_controller",
+       "wii_input",
+-      "sd_card",       "sd_sync",      "sd_writes",       "sd_size"};
++      "sd_card",       "sd_sync",      "sd_writes",       "sd_size", "wii_disc"};
+   for (const char* category : PS4Settings::Categories())
+   {
+     if (!m_panel.category.empty() && m_panel.category != category)
