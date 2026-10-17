@@ -1,8 +1,10 @@
 # This fork
 
 Based on Dolphin for PS4 **v04.13** (iHaiDeeZ/DolphinPS4). The original patch is untouched
-(`patches/dolphin-ps4.patch`); everything this fork adds is one patch on top, `patches/fork-mods.patch`,
-so a new upstream version only needs that patch checked again.
+(`patches/dolphin-ps4.patch`); what this fork adds is applied on top of it: `patches/fork-mods.patch` (the
+Gecko / SD card code in Dolphin's core, which upstream doesn't touch) and `scripts/apply-fork-settings.py`
+(the port's settings, edited by text so it survives upstream changes). A new upstream version only needs
+those two checked again.
 
 ## What it adds
 
@@ -18,7 +20,8 @@ so a new upstream version only needs that patch checked again.
 of this repository are set up for the author's experimental "Dolphin Lab" copy (`DLPH00011`,
 version 01.00); the workflow sets `PS4_TITLE_ID=DLPH00010`, `PS4_APP_NAME=Dolphin`,
 `PS4_CONTENT_LABEL=DOLPHIN` and the `VERSION` file's number, so the package is the regular app and
-installs over it. Leave the version box empty to use `VERSION`.
+installs over it. Leave the version box empty and it takes the number of the original's latest release
+(`VERSION` is the fallback).
 
 ## Updates
 
