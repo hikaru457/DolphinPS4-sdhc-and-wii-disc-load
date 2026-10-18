@@ -270,6 +270,53 @@ def statement_end(text, pos):
     fail("MainNoGUI.cpp: statement without end")
 
 
+SDHC_IOS = (
+    "  // SDHC cards (over 2 GB) are only handled by the IOS versions that know them (48, 56-62, 70,\n"
+    "  // 80). A game runs on the IOS its disc asks for (Brawl: IOS 36...), which doesn't: the game\n"
+    "  // sees a card that was never initialised and can't read it (Project M's pf files). Project M's\n"
+    "  // loader works around it by reloading IOS 58 before it starts the game; so does this.\n"
+    "  if (boot && std::holds_alternative<BootParameters::Disc>(boot->parameters))\n"
+    "  {\n"
+    "    const auto& sdhc_disc = std::get<BootParameters::Disc>(boot->parameters);\n"
+    "    if (sdhc_disc.volume && sdhc_disc.volume->GetVolumeType() == DiscIO::Platform::WiiDisc &&\n"
+    "        Config::Get(Config::MAIN_WII_SD_CARD) && Config::Get(Config::MAIN_OVERRIDE_BOOT_IOS) < 0)\n"
+    "    {\n"
+    "      u64 sd_size = File::GetSize(File::GetUserPath(F_WIISDCARDIMAGE_IDX));\n"
+    "      if (Config::Get(Config::MAIN_WII_SD_CARD_ENABLE_FOLDER_SYNC))\n"
+    "        sd_size = std::max<u64>(sd_size, Config::Get(Config::MAIN_WII_SD_CARD_FILESIZE));\n"
+    "      const IOS::ES::TMDReader& sdhc_tmd =\n"
+    "          sdhc_disc.volume->GetTMD(sdhc_disc.volume->GetGamePartition());\n"
+    "      if (sd_size > 0x80000000ULL && sdhc_tmd.IsValid() &&\n"
+    "          !IOS::HLE::HasFeature(static_cast<u32>(sdhc_tmd.GetIOSId() & 0xFFFFFFFF),\n"
+    "                                IOS::HLE::Feature::SDv2))\n"
+    "      {\n"
+    "        Config::SetCurrent(Config::MAIN_OVERRIDE_BOOT_IOS, 58);\n"
+    "        Platform::BootTrace(\"SDHC card: the game starts on IOS 58\");\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+)
+
+
+def patch_sdhc_ios(s):
+    """Inserted right before the boot, where the disc and the SD settings are known."""
+    if "IOS::HLE::Feature::SDv2" in s:
+        return s
+    m = re.search(r'^([ \t]*)Platform::BootTrace\(\s*"BootCore"\s*\);', s, re.M)
+    if not m:
+        # Same function, just before the launch_disc handling (it comes right after the boot trace).
+        m = re.search(r'^([ \t]*).*GetPS4Option\(\s*"launch_disc"', s, re.M)
+    if not m:
+        fail('MainNoGUI.cpp: neither the "BootCore" trace nor the launch_disc handling were found '
+             "(needed for the SDHC IOS)")
+    s = s[: m.start()] + SDHC_IOS + s[m.start():]
+    s = add_include(s, '#include "Core/IOS/ES/Formats.h"', r'^#include "Core/Config/MainSettings.h"$')
+    s = add_include(s, '#include "Core/IOS/VersionInfo.h"', r'^#include "Core/IOS/ES/Formats.h"$')
+    if "#include <algorithm>" not in s:
+        s = add_include(s, "#include <algorithm>", None)
+    return s
+
+
 def patch_main():
     s = read("MainNoGUI.cpp")
     if "GetPS4Option(\"wii_disc\"" not in s:
@@ -290,8 +337,9 @@ def patch_main():
                 fail("MainNoGUI.cpp: neither the SD card settings nor the launch_disc handling "
                      "were found")
             s = s[: m.start()] + WII_DISC_BOOT + s[m.start():]
+    s = patch_sdhc_ios(s)
     write("MainNoGUI.cpp", s)
-    print("apply-fork-settings: MainNoGUI.cpp ok (Wii Disc at boot)")
+    print("apply-fork-settings: MainNoGUI.cpp ok (Wii Disc at boot, SDHC IOS)")
 
 
 patch_settings()
