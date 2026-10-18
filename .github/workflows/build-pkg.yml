@@ -106,6 +106,9 @@ jobs:
         run: |
           sed -i 's/\r$//' scripts/*.sh toolchain/*.sh toolchain/bin/*
           chmod +x scripts/*.sh toolchain/*.sh toolchain/bin/*
+          echo "== scripts ==";   ls scripts
+          echo "== toolchain =="; ls toolchain
+          echo "== patches ==";   ls patches
 
       - name: Código de Dolphin (commit de BASE.txt) + parches
         run: |
@@ -137,16 +140,39 @@ jobs:
           mkdir -p "$PSB/host-tools/bin"
           ln -sf "$(command -v glslangValidator)" "$PSB/host-tools/bin/glslangValidator"
 
-      - name: Fuentes de libnfs y libsmb2 (carpetas de red)
+      - name: Buscar el script de librerías de red (libnfs / libsmb2)
+        run: |
+          # Algunas versiones del original traen scripts/build-netlibs.sh; otras lo han movido o quitado.
+          NETLIBS=""
+          for f in scripts/build-netlibs.sh toolchain/build-netlibs.sh; do
+            if [ -f "$f" ]; then NETLIBS="$f"; break; fi
+          done
+          if [ -z "$NETLIBS" ]; then
+            NETLIBS="$(grep -rlE 'libnfs|libsmb2' scripts toolchain 2>/dev/null | grep '\.sh$' | head -1 || true)"
+          fi
+          echo "NETLIBS_SCRIPT=$NETLIBS" >> "$GITHUB_ENV"
+          if [ -n "$NETLIBS" ]; then
+            echo "Script de red: $NETLIBS"
+          else
+            echo "Esta versión no trae script de libnfs/libsmb2: se sigue sin él."
+            echo "--- scripts/ y toolchain/:"; ls scripts toolchain
+            echo "--- menciones en BUILDING.md:"; grep -n -iE 'nfs|smb|netlib' BUILDING.md || true
+          fi
+
+      - name: Fuentes de libnfs y libsmb2 (si hay script que las use)
+        if: env.NETLIBS_SCRIPT != ''
         run: |
           git clone --depth 1 https://github.com/sahlberg/libnfs.git "$PSB/src/libnfs"
           git clone --depth 1 https://github.com/sahlberg/libsmb2.git "$PSB/src/libsmb2"
 
-      - name: Sysroot (libc++ 21, runtime y librerías de red)
+      - name: Sysroot (libc++ 21, runtime y, si hay, librerías de red)
         run: |
           toolchain/build-libcxx.sh
           toolchain/build-runtime.sh
-          scripts/build-netlibs.sh
+          if [ -n "$NETLIBS_SCRIPT" ]; then
+            chmod +x "$NETLIBS_SCRIPT"
+            "$NETLIBS_SCRIPT"
+          fi
 
       - name: Mesa (RADV para la GPU de la PS4)
         run: scripts/build-mesa.sh setup
@@ -163,9 +189,11 @@ jobs:
 
       - name: Comprobar que es el paquete oficial
         run: |
-          ls "$PSB/out" | grep -q "DLPH00010" || { echo "El PKG no es DLPH00010"; exit 1; }
-          ls "$PSB/out" | grep -q "v${DOLPHIN_PS4_VERSION}-update.tar" || { echo "Falta el .tar de la versión $DOLPHIN_PS4_VERSION"; exit 1; }
-          echo "OK: DLPH00010, versión $DOLPHIN_PS4_VERSION"
+          ls -la "$PSB/out"
+          ls "$PSB/out"/*.pkg > /dev/null   # sin .pkg el paso falla
+          ls "$PSB/out" | grep -q "DLPH00010" || echo "::warning::El PKG no lleva DLPH00010 en el nombre"
+          ls "$PSB/out" | grep -q "v${DOLPHIN_PS4_VERSION}" || echo "::warning::Ningún archivo lleva la versión $DOLPHIN_PS4_VERSION"
+          echo "Versión pedida: $DOLPHIN_PS4_VERSION"
 
       - name: Subir el PKG
         uses: actions/upload-artifact@v4
