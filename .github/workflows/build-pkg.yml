@@ -1,0 +1,203 @@
+name: Build Dolphin PS4 PKG
+
+# Compila el PKG en los servidores de GitHub (sin WSL), siguiendo BUILDING.md.
+# Se lanza a mano: pestaña Actions -> "Build Dolphin PS4 PKG" -> Run workflow.
+# El PKG es el oficial (DLPH00010 "Dolphin", como las releases de iHaiDeeZ), no "Dolphin Lab".
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versión del PKG (NN.NN). Vacío = la última release del original (o el archivo VERSION)"
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      PSB: /home/runner/dolphinps4-build
+      # Los scripts de este repositorio vienen configurados para la copia "Dolphin Lab"
+      # (DLPH00011, versión 01.00). Estas variables los llevan al paquete oficial.
+      DOLPHIN_SRC: /home/runner/dolphinps4-build/src/dolphin
+      DOLPHIN_BUILD: /home/runner/dolphinps4-build/build/dolphin
+      PS4_TITLE_ID: DLPH00010
+      PS4_APP_NAME: Dolphin
+      PS4_CONTENT_LABEL: DOLPHIN
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout del fork
+        uses: actions/checkout@v4
+
+      - name: Versión del paquete
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          # Entrada > última release de iHaiDeeZ/DolphinPS4 (para instalarse encima de ella) > VERSION.
+          V="$INPUT_VERSION"
+          FROM="la casilla"
+          if [ -z "$V" ]; then
+            TAG="$(gh release view --repo iHaiDeeZ/DolphinPS4 --json tagName -q .tagName 2>/dev/null || true)"
+            TAG="${TAG#v}"
+            if [[ "$TAG" =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
+              V="$TAG"
+              FROM="la última release del original"
+            fi
+          fi
+          if [ -z "$V" ]; then
+            V="$(tr -d '[:space:]' < VERSION)"
+            FROM="archivo VERSION"
+          fi
+          echo "DOLPHIN_PS4_VERSION=$V" >> "$GITHUB_ENV"
+          echo "Versión del PKG: $V (origen: $FROM)"
+
+      - name: Liberar disco
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3-venv python3-pil pkg-config \
+            flex bison glslang-tools libxml2 curl git zip xz-utils gettext
+
+      - name: clang 21 y lld 21
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y clang-21 lld-21 llvm-21
+          clang-21 --version
+          ld.lld-21 --version
+          llvm-ar-21 --version
+
+      - name: OpenOrbis (PacBrew) en /opt/pacbrew/ps4/openorbis
+        run: |
+          # 1) pacbrew-pacman (su servidor a veces no responde: 3 intentos).
+          gh release download --repo PacBrew/pacbrew-pacman --pattern '*.deb' --dir /tmp
+          sudo dpkg -i /tmp/pacbrew-pacman*.deb
+          for i in 1 2 3; do
+            if sudo pacbrew-pacman -Sy --noconfirm && sudo pacbrew-pacman -S --noconfirm ps4-openorbis; then
+              break
+            fi
+            echo "PacBrew no responde (intento $i/3), espero 30 s..."
+            sleep 30
+          done
+          # 2) Plan B: /opt/pacbrew de la imagen Docker xfangfang/pacbrew (ya trae ps4-openorbis).
+          if [ ! -f /opt/pacbrew/ps4/openorbis/ps4vars.sh ]; then
+            echo "Usando la imagen Docker xfangfang/pacbrew"
+            docker pull xfangfang/pacbrew:latest
+            id=$(docker create xfangfang/pacbrew:latest /bin/true)
+            rm -rf /tmp/pacbrew-copy
+            docker cp "$id:/opt/pacbrew" /tmp/pacbrew-copy
+            docker rm "$id"
+            sudo rm -rf /opt/pacbrew
+            sudo mv /tmp/pacbrew-copy /opt/pacbrew
+          fi
+          test -f /opt/pacbrew/ps4/openorbis/ps4vars.sh
+          ls /opt/pacbrew/ps4/openorbis
+
+      - name: Permisos y saltos de línea de los scripts
+        run: |
+          sed -i 's/\r$//' scripts/*.sh toolchain/*.sh toolchain/bin/*
+          chmod +x scripts/*.sh toolchain/*.sh toolchain/bin/*
+          echo "== scripts ==";   ls scripts
+          echo "== toolchain =="; ls toolchain
+          echo "== patches ==";   ls patches
+
+      - name: Código de Dolphin (commit de BASE.txt) + parches
+        run: |
+          BASE=$(awk '{print $2}' patches/BASE.txt)
+          echo "Dolphin base: $BASE"
+          mkdir -p "$PSB/src/dolphin"
+          cd "$PSB/src/dolphin"
+          git init -q .
+          git remote add origin https://github.com/dolphin-emu/dolphin
+          git fetch --depth 1 origin "$BASE"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          sha256sum "$GITHUB_WORKSPACE/patches/dolphin-ps4.patch" "$GITHUB_WORKSPACE/patches/fork-mods.patch"
+          # 1) los cambios del port original
+          git apply --whitespace=nowarn "$GITHUB_WORKSPACE/patches/dolphin-ps4.patch"
+          # 2) el núcleo de este fork: Project M nativo y lectura de la imagen de la SD
+          git apply --whitespace=nowarn "$GITHUB_WORKSPACE/patches/fork-mods.patch" \
+            || git apply --3way --whitespace=nowarn "$GITHUB_WORKSPACE/patches/fork-mods.patch"
+          # 3) los ajustes del port (SD hasta 32 GB, Wii Disc): por texto, no por líneas
+          python3 "$GITHUB_WORKSPACE/scripts/apply-fork-settings.py" "$PSB/src/dolphin"
+
+      - name: Mesa 26.0.8 + libdrm (solo cabeceras) + herramientas de host
+        run: |
+          git clone --depth 1 --branch mesa-26.0.8 https://gitlab.freedesktop.org/mesa/mesa.git "$PSB/src/mesa"
+          git -C "$PSB/src/mesa" apply "$GITHUB_WORKSPACE/patches/mesa-ps4.patch"
+          git clone --depth 1 --branch libdrm-2.4.125 https://gitlab.freedesktop.org/mesa/libdrm.git "$PSB/src/libdrm"
+          python3 -m venv "$PSB/mesa-venv"
+          "$PSB/mesa-venv/bin/pip" install meson mako pyyaml packaging setuptools
+          mkdir -p "$PSB/host-tools/bin"
+          ln -sf "$(command -v glslangValidator)" "$PSB/host-tools/bin/glslangValidator"
+
+      - name: Buscar el script de librerías de red (libnfs / libsmb2)
+        run: |
+          # Algunas versiones del original traen scripts/build-netlibs.sh; otras lo han movido o quitado.
+          NETLIBS=""
+          for f in scripts/build-netlibs.sh toolchain/build-netlibs.sh; do
+            if [ -f "$f" ]; then NETLIBS="$f"; break; fi
+          done
+          if [ -z "$NETLIBS" ]; then
+            NETLIBS="$(grep -rlE 'libnfs|libsmb2' scripts toolchain 2>/dev/null | grep '\.sh$' | head -1 || true)"
+          fi
+          echo "NETLIBS_SCRIPT=$NETLIBS" >> "$GITHUB_ENV"
+          if [ -n "$NETLIBS" ]; then
+            echo "Script de red: $NETLIBS"
+          else
+            echo "Esta versión no trae script de libnfs/libsmb2: se sigue sin él."
+            echo "--- scripts/ y toolchain/:"; ls scripts toolchain
+            echo "--- menciones en BUILDING.md:"; grep -n -iE 'nfs|smb|netlib' BUILDING.md || true
+          fi
+
+      - name: Fuentes de libnfs y libsmb2 (si hay script que las use)
+        if: env.NETLIBS_SCRIPT != ''
+        run: |
+          git clone --depth 1 https://github.com/sahlberg/libnfs.git "$PSB/src/libnfs"
+          git clone --depth 1 https://github.com/sahlberg/libsmb2.git "$PSB/src/libsmb2"
+
+      - name: Sysroot (libc++ 21, runtime y, si hay, librerías de red)
+        run: |
+          toolchain/build-libcxx.sh
+          toolchain/build-runtime.sh
+          if [ -n "$NETLIBS_SCRIPT" ]; then
+            chmod +x "$NETLIBS_SCRIPT"
+            "$NETLIBS_SCRIPT"
+          fi
+
+      - name: Mesa (RADV para la GPU de la PS4)
+        run: scripts/build-mesa.sh setup
+
+      - name: Configurar y compilar Dolphin
+        run: |
+          scripts/configure-dolphin.sh
+          JOBS="$(nproc)" scripts/build-dolphin.sh
+
+      - name: Empaquetar el PKG
+        run: |
+          scripts/package-dolphin.sh
+          ls -la "$PSB/out"
+
+      - name: Comprobar que es el paquete oficial
+        run: |
+          ls -la "$PSB/out"
+          ls "$PSB/out"/*.pkg > /dev/null   # sin .pkg el paso falla
+          ls "$PSB/out" | grep -q "DLPH00010" || echo "::warning::El PKG no lleva DLPH00010 en el nombre"
+          ls "$PSB/out" | grep -q "v${DOLPHIN_PS4_VERSION}" || echo "::warning::Ningún archivo lleva la versión $DOLPHIN_PS4_VERSION"
+          echo "Versión pedida: $DOLPHIN_PS4_VERSION"
+
+      - name: Subir el PKG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-PS4-pkg
+          path: /home/runner/dolphinps4-build/out/*
+          if-no-files-found: error
