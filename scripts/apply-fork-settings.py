@@ -317,6 +317,106 @@ def patch_sdhc_ios(s):
     return s
 
 
+PM_HELPER = r"""#ifdef __ORBIS__
+namespace
+{
+// Project M (and the mods built on it): the mod's pf folder, served as part of the disc. The game
+// then finds the mod's stages, character select screen and music in its own file system, with no
+// need to read them from the SD card. Looked for in User/Load/ProjectM/pf,
+// User/Load/WiiSDSync/projectm/pf and User/Load/Riivolution/projectm/pf (any letter case).
+std::optional<DiscIO::Riivolution::Patch> ProjectMPatch(const std::string& game_id)
+{
+  if (game_id.compare(0, 3, "RSB") != 0)
+    return std::nullopt;
+  const std::pair<std::string, const char*> places[] = {
+      {File::GetUserPath(D_LOAD_IDX), "/ProjectM/pf"},
+      {File::GetUserPath(D_WIISDCARDSYNCFOLDER_IDX), "/projectm/pf"},
+      {File::GetUserPath(D_RIIVOLUTION_IDX), "/projectm/pf"}};
+  for (const auto& [root, external] : places)
+  {
+    auto loader = std::make_shared<DiscIO::Riivolution::FileDataLoaderHostFS>(
+        root, root + "projectm.xml", "");
+    if (loader->GetFolderContents(external).empty())
+      continue;
+    DiscIO::Riivolution::Folder folder;
+    folder.m_disc = "/pf";
+    folder.m_external = external;
+    folder.m_resize = true;
+    folder.m_create = true;
+    folder.m_recursive = true;
+    DiscIO::Riivolution::Patch patch;
+    patch.m_id = "projectm-pf";
+    patch.m_file_data_loader = std::move(loader);
+    patch.m_folder_patches.push_back(std::move(folder));
+    return patch;
+  }
+  return std::nullopt;
+}
+}  // namespace
+#endif
+
+"""
+
+PM_STANDALONE = (
+    "  // Project M and the mods built on it: the pf folder as part of the disc (see ProjectMPatch).\n"
+    "  if (boot && std::holds_alternative<BootParameters::Disc>(boot->parameters))\n"
+    "  {\n"
+    "    const auto& pm_disc = std::get<BootParameters::Disc>(boot->parameters);\n"
+    "    if (pm_disc.volume && pm_disc.volume->GetVolumeType() == DiscIO::Platform::WiiDisc)\n"
+    "    {\n"
+    "      if (auto pm_patch = ProjectMPatch(pm_disc.volume->GetGameID()))\n"
+    "      {\n"
+    "        std::vector<DiscIO::Riivolution::Patch> pm_patches;\n"
+    "        pm_patches.push_back(std::move(*pm_patch));\n"
+    "        AddRiivolutionPatches(boot.get(), std::move(pm_patches));\n"
+    "        Platform::BootTrace(\"projectm: the pf folder is served as part of the disc\");\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+)
+
+
+def patch_projectm_pf(s):
+    """The pf folder of a Project M mod, added to the disc together with the Riivolution patches."""
+    if "ProjectMPatch(" in s:
+        return s
+    m_main = re.search(r"^int main\s*\(", s, re.M)
+    if not m_main:
+        fail("MainNoGUI.cpp: main() was not found (needed for the Project M pf folder)")
+    m = re.search(r"^([ \t]*)auto\s+(\w+)\s*=\s*(?:DiscIO::Riivolution::)?"
+                  r"GenerateRiivolutionPatchesFromConfig\(", s, re.M)
+    if m:
+        end = statement_end(s, m.end())
+        mm = re.search(r"\w+\.volume->GetGameID\(\)", s[m.start(): m.start() + 600])
+        if not mm:
+            fail("MainNoGUI.cpp: the Riivolution block no longer reads volume->GetGameID()")
+        nl = s.find("\n", end)
+        nl = len(s) if nl < 0 else nl + 1
+        i, var = m.group(1), m.group(2)
+        call = (f"{i}// Project M and the mods built on it: the pf folder as part of the disc.\n"
+                f"{i}if (auto pm_patch = ProjectMPatch({mm.group(0)}))\n"
+                f"{i}{{\n"
+                f"{i}  {var}.push_back(std::move(*pm_patch));\n"
+                f'{i}  Platform::BootTrace("projectm: the pf folder is served as part of the disc");\n'
+                f"{i}}}\n")
+        s = s[:nl] + call + s[nl:]
+    elif "GenerateRiivolutionPatchesFromConfig" in s:
+        fail("MainNoGUI.cpp: the Riivolution block changed shape (needed for the Project M pf folder)")
+    else:
+        b = re.search(r'^([ \t]*)Platform::BootTrace\(\s*"BootCore"\s*\);', s, re.M)
+        if not b:
+            fail('MainNoGUI.cpp: neither the Riivolution block nor the "BootCore" trace were found')
+        s = s[: b.start()] + PM_STANDALONE + s[b.start():]
+    m_main = re.search(r"^int main\s*\(", s, re.M)
+    s = s[: m_main.start()] + PM_HELPER + s[m_main.start():]
+    s = add_include(s, '#include "DiscIO/RiivolutionPatcher.h"', r'^#include "DiscIO/RiivolutionParser.h"$')
+    if "#include <optional>" not in s:
+        s = add_include(s, "#include <optional>", None)
+    if "#include <memory>" not in s:
+        s = add_include(s, "#include <memory>", None)
+    return s
+
+
 def patch_main():
     s = read("MainNoGUI.cpp")
     if "GetPS4Option(\"wii_disc\"" not in s:
@@ -338,8 +438,9 @@ def patch_main():
                      "were found")
             s = s[: m.start()] + WII_DISC_BOOT + s[m.start():]
     s = patch_sdhc_ios(s)
+    s = patch_projectm_pf(s)
     write("MainNoGUI.cpp", s)
-    print("apply-fork-settings: MainNoGUI.cpp ok (Wii Disc at boot, SDHC IOS)")
+    print("apply-fork-settings: MainNoGUI.cpp ok (Wii Disc at boot, SDHC IOS, Project M pf)")
 
 
 patch_settings()
