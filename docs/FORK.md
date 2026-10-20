@@ -12,7 +12,8 @@ those two checked again.
 |---|---|
 | **SD cards up to 32 GB** | Settings -> System -> *SD Card Size*: 4, 8, 16 and 32 GB (SDHC). Dolphin already emulates SDHC for cards over 2 GB. A ready-made `WiiSD.raw` of any size also works. |
 | **Wii Disc** | Settings -> System -> *Wii Disc*: the disc in the Wii's drive for the Wii Menu, `.wad` files and Wii `.dol` / `.elf` programs. The list is the disc images of the games folder, read when the app starts. A `launch.txt` `disc=` line still wins. |
-| **Project M, native** | See [PROJECT-M.md](PROJECT-M.md): the mod's `codes/*.gct` and `gameconfig.txt` are read from the SD folder or the card image, in any letter case. |
+| **SDHC on any Wii game** | A game whose IOS can't use an SD card over 2 GB starts on IOS 58 instead (what Project M's loader does), so the card works. |
+| **Project M, native** | See [PROJECT-M.md](PROJECT-M.md): copy the mod's `codes`, `gameconfig.txt` and `pf` to `User/Load/ProjectM/` and start Brawl. The codes are read from there (or the SD folder, or the card image) and the `pf` folder is served as part of the disc. |
 
 ## Building
 
