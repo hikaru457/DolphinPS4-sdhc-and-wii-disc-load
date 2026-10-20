@@ -213,7 +213,7 @@ index 716bcf9..f9bcffc 100644
  void Shutdown();
  void DoState(PointerWrap&);
 diff --git a/Source/Core/Core/GeckoCodeConfig.cpp b/Source/Core/Core/GeckoCodeConfig.cpp
-index 83243c8..9bbca09 100644
+index 83243c8..af325f3 100644
 --- a/Source/Core/Core/GeckoCodeConfig.cpp
 +++ b/Source/Core/Core/GeckoCodeConfig.cpp
 @@ -3,15 +3,29 @@
@@ -246,7 +246,7 @@ index 83243c8..9bbca09 100644
  
  namespace Gecko
  {
-@@ -121,6 +135,388 @@ std::expected<std::vector<GeckoCode>, int> DownloadCodes(std::string_view gametd
+@@ -121,6 +135,411 @@ std::expected<std::vector<GeckoCode>, int> DownloadCodes(std::string_view gametd
    return gcodes;
  }
  
@@ -418,8 +418,9 @@ index 83243c8..9bbca09 100644
 +enum class SDSource
 +{
 +  None,
-+  Folder,  // User/Load/WiiSDSync
-+  Image    // User/Load/WiiSD.raw
++  ModFolder,  // User/Load/ProjectM
++  Folder,     // User/Load/WiiSDSync
++  Image       // User/Load/WiiSD.raw
 +};
 +
 +// The entry of `dir` called `name`, without regard to case: the console's file system tells
@@ -441,36 +442,50 @@ index 83243c8..9bbca09 100644
 +  return std::nullopt;
 +}
 +
-+// A file of the emulated SD card, by its path on the card ("codes/RSBE01.gct"; names are matched
-+// without regard to case). First the SD folder (User/Load/WiiSDSync), then the card image
-+// (User/Load/WiiSD.raw): the mod works from either, with no unpacking.
++// `path` ("codes/RSBE01.gct") below the folder `root`, names matched without regard to case.
++bool ReadFromFolder(std::string root, const std::string& path, std::string* out)
++{
++  while (!root.empty() && root.back() == '/')
++    root.pop_back();
++  if (root.empty())
++    return false;
++  std::string current = root;
++  for (const std::string& part : SplitString(path, '/'))
++  {
++    if (part.empty())
++      continue;
++    const std::optional<std::string> name = FindNoCase(current, part);
++    if (!name)
++      return false;
++    current += "/" + *name;
++  }
++  std::string text;
++  if (!File::ReadFileToString(current, text) || text.size() > MAX_SD_FILE_SIZE)
++    return false;
++  *out = std::move(text);
++  return true;
++}
++
++// A file of the mod's SD card, by its path on the card ("codes/RSBE01.gct"; names are matched
++// without regard to case). Looked for in the mod folder (User/Load/ProjectM: the mod's files as
++// they are on its card), then the SD folder (User/Load/WiiSDSync), then the card image
++// (User/Load/WiiSD.raw): the mod works from any of them, with no unpacking.
 +SDSource ReadSDFile(const std::string& path, std::string* out)
 +{
-+  std::string current = File::GetUserPath(D_WIISDCARDSYNCFOLDER_IDX);
-+  while (!current.empty() && current.back() == '/')
-+    current.pop_back();
-+  if (!current.empty())
++  const std::string load_dir = File::GetUserPath(D_LOAD_IDX);
++  std::string mod_folder = load_dir;
++  while (!mod_folder.empty() && mod_folder.back() == '/')
++    mod_folder.pop_back();
++  if (!mod_folder.empty())
 +  {
-+    bool found = true;
-+    for (const std::string& part : SplitString(path, '/'))
++    if (const std::optional<std::string> name = FindNoCase(mod_folder, "ProjectM"))
 +    {
-+      if (part.empty())
-+        continue;
-+      const std::optional<std::string> name = FindNoCase(current, part);
-+      if (!name)
-+      {
-+        found = false;
-+        break;
-+      }
-+      current += "/" + *name;
-+    }
-+    std::string text;
-+    if (found && File::ReadFileToString(current, text) && text.size() <= MAX_SD_FILE_SIZE)
-+    {
-+      *out = std::move(text);
-+      return SDSource::Folder;
++      if (ReadFromFolder(mod_folder + "/" + *name, path, out))
++        return SDSource::ModFolder;
 +    }
 +  }
++  if (ReadFromFolder(File::GetUserPath(D_WIISDCARDSYNCFOLDER_IDX), path, out))
++    return SDSource::Folder;
 +  std::string text;
 +  if (Common::ReadFileFromSDImage("/" + path, &text) && text.size() <= MAX_SD_FILE_SIZE)
 +  {
@@ -482,7 +497,15 @@ index 83243c8..9bbca09 100644
 +
 +const char* SDSourceName(SDSource source)
 +{
-+  return source == SDSource::Folder ? "SD folder" : "SD image";
++  switch (source)
++  {
++  case SDSource::ModFolder:
++    return "ProjectM folder";
++  case SDSource::Folder:
++    return "SD folder";
++  default:
++    return "SD image";
++  }
 +}
 +
 +// The names a game's Gecko OS code list can have: RSBE01.gct, RSB.gct, RSBE.gct.
@@ -635,7 +658,7 @@ index 83243c8..9bbca09 100644
  std::vector<GeckoCode> LoadCodes(const Common::IniFile& globalIni, const Common::IniFile& localIni)
  {
    std::vector<GeckoCode> gcodes;
-@@ -197,6 +593,28 @@ std::vector<GeckoCode> LoadCodes(const Common::IniFile& globalIni, const Common:
+@@ -197,6 +616,28 @@ std::vector<GeckoCode> LoadCodes(const Common::IniFile& globalIni, const Common:
      }
    }
  
