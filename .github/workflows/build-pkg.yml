@@ -129,6 +129,8 @@ jobs:
             || git apply --3way --whitespace=nowarn "$GITHUB_WORKSPACE/patches/fork-mods.patch"
           # 3) los ajustes del port (SD hasta 32 GB, Wii Disc): por texto, no por líneas
           python3 "$GITHUB_WORKSPACE/scripts/apply-fork-settings.py" "$PSB/src/dolphin"
+          # 4) diagnóstico: qué archivo pide el juego cuando lee más allá del final del disco
+          python3 "$GITHUB_WORKSPACE/scripts/apply-dvd-diag.py" "$PSB/src/dolphin"
 
       - name: Mesa 26.0.8 + libdrm (solo cabeceras) + herramientas de host
         run: |
